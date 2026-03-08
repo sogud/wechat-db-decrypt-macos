@@ -243,6 +243,24 @@ def _find_msg_table(username):
     return None, None
 
 
+def _find_all_msg_tables(username):
+    """Find ALL DBs that contain messages for this username. Returns list of (db_path, table_name)."""
+    table = _username_to_table(username)
+    results = []
+    for db_path in _get_msg_dbs():
+        conn = sqlite3.connect(db_path)
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if exists:
+                results.append((db_path, table))
+        finally:
+            conn.close()
+    return results
+
+
 def _parse_message(content, local_type, is_group, names):
     """Parse message content, return formatted string."""
     if content is None:
@@ -357,13 +375,13 @@ def get_chat_history(chat_name: str, limit: int = 50, start_date: str = "", end_
     display_name = names.get(username, username)
     is_group = "@chatroom" in username
 
-    db_path, table_name = _find_msg_table(username)
-    if not db_path:
+    db_tables = _find_all_msg_tables(username)
+    if not db_tables:
         return f"找不到 {display_name} 的消息记录"
 
     # Build time filter
     conditions = []
-    params = []
+    time_params = []
     if start_date:
         try:
             for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
@@ -375,7 +393,7 @@ def get_chat_history(chat_name: str, limit: int = 50, start_date: str = "", end_
             else:
                 return f"日期格式错误: {start_date}，请用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM"
             conditions.append("create_time >= ?")
-            params.append(ts)
+            time_params.append(ts)
         except Exception:
             return f"日期格式错误: {start_date}，请用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM"
     if end_date:
@@ -393,24 +411,32 @@ def get_chat_history(chat_name: str, limit: int = 50, start_date: str = "", end_
                 dt = dt.replace(hour=23, minute=59, second=59)
             ts = int(dt.timestamp())
             conditions.append("create_time <= ?")
-            params.append(ts)
+            time_params.append(ts)
         except Exception:
             return f"日期格式错误: {end_date}，请用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM"
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    params.append(limit)
 
-    conn = sqlite3.connect(db_path)
-    try:
-        rows = conn.execute(f"""
-            SELECT local_type, create_time, message_content
-            FROM [{table_name}]
-            {where}
-            ORDER BY create_time DESC
-            LIMIT ?
-        """, params).fetchall()
-    finally:
-        conn.close()
+    # Query all matching databases and merge results
+    rows = []
+    for db_path, table_name in db_tables:
+        params = time_params + [limit]
+        conn = sqlite3.connect(db_path)
+        try:
+            db_rows = conn.execute(f"""
+                SELECT local_type, create_time, message_content
+                FROM [{table_name}]
+                {where}
+                ORDER BY create_time DESC
+                LIMIT ?
+            """, params).fetchall()
+            rows.extend(db_rows)
+        finally:
+            conn.close()
+
+    # Sort by time descending and take top N
+    rows.sort(key=lambda x: x[1], reverse=True)
+    rows = rows[:limit]
 
     if not rows:
         msg = f"{display_name} 无消息记录"
